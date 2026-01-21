@@ -1,0 +1,149 @@
+// === CONFIGURACIÓN DE PRODUCCIÓN ===
+const CONFIG = {
+  apiUrl: window.location.origin + '/api', // Auto-detecta la URL de Vercel
+  stripe: {
+    publishableKey: 'pk_live_51TU...your_key' // CAMBIA ESTO
+  },
+  brand: {
+    name: 'Apollo Peak Premium',
+    supportEmail: 'support@apollopeak.io'
+  }
+};
+
+// === GESTIÓN DE CARRITO ===
+let CART = JSON.parse(localStorage.getItem('apollo_cart') || '[]');
+let USER = JSON.parse(localStorage.getItem('apollo_user') || '{"id":"guest","balance":0.00,"purchased":[]}');
+
+async function createStripeCheckout() {
+  if (CART.length === 0) {
+    showToast('Carrito vacío', 'Añade workflows antes de pagar', 'error');
+    return;
+  }
+
+  showToast('Conectando con Stripe...', 'Preparando pago seguro', 'loader');
+
+  try {
+    // Preparar items para Stripe
+    const itemsByLevel = CART.reduce((acc, item) => {
+      const level = item.level;
+      if (!acc[level]) acc[level] = [];
+      acc[level].push(item);
+      return acc;
+    }, {});
+
+    const lineItems = Object.entries(itemsByLevel).map(([level, items]) => ({
+      price: getPriceIdForLevel(level),
+      quantity: items.length
+    }));
+
+    // Llamar a tu backend
+    const response = await fetch(`${CONFIG.apiUrl}/create-checkout-session`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        items: lineItems,
+        metadata: {
+          items: JSON.stringify(CART.map(item => item.uid)),
+          userId: USER.id,
+          customerEmail: USER.email || 'cliente@apollopeak.io'
+        }
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error('Error al crear sesión de pago');
+    }
+
+    const { sessionId } = await response.json();
+    
+    // Inicializar Stripe.js
+    const stripe = Stripe(CONFIG.stripe.publishableKey);
+    const result = await stripe.redirectToCheckout({ sessionId });
+
+    if (result.error) {
+      throw new Error(result.error.message);
+    }
+
+  } catch (error) {
+    showToast('Error de pago', error.message, 'error');
+    console.error('Checkout error:', error);
+  }
+}
+
+function getPriceIdForLevel(level) {
+  const priceIds = {
+    starter: 'price_1YourStarterPriceId',
+    ready: 'price_1YourReadyPriceId',
+    superpremium: 'price_1YourSuperPremiumPriceId'
+  };
+  return priceIds[level];
+}
+
+// === VERIFICACIÓN DE PAGO (Página de Éxito) ===
+async function verifyPurchase(sessionId) {
+  try {
+    const response = await fetch(`${CONFIG.apiUrl}/verify-session?session_id=${sessionId}`);
+    const data = await response.json();
+    
+    if (data.success) {
+      // Marcar productos como comprados
+      const purchasedIds = data.purchasedItems;
+      USER.purchased = [...new Set([...USER.purchased, ...purchasedIds])];
+      localStorage.setItem('apollo_user', JSON.stringify(USER));
+      
+      // Vaciar carrito
+      CART = [];
+      localStorage.setItem('apollo_cart', JSON.stringify(CART));
+      
+      showToast('¡Pago Exitoso!', `Se procesaron ${purchasedIds.length} workflows`, 'success');
+      return true;
+    }
+  } catch (error) {
+    console.error('Verification error:', error);
+  }
+  return false;
+}
+
+// === DESCARGA SEGURA ===
+async function downloadProduct(uid) {
+  if (!USER.purchased.includes(uid)) {
+    showToast('Acceso denegado', 'Debes comprar este workflow primero', 'error');
+    return;
+  }
+
+  try {
+    const response = await fetch(`${CONFIG.apiUrl}/download/${uid}?userId=${USER.id}&token=${generateTempToken()}`);
+    
+    if (response.ok) {
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `workflow-${uid}.json`;
+      a.click();
+      
+      showToast('Descarga iniciada', 'Tu workflow está listo', 'success');
+    } else {
+      throw new Error('No tienes acceso');
+    }
+  } catch (error) {
+    showToast('Error', error.message, 'error');
+  }
+}
+
+// === HELPERS ===
+function generateTempToken() {
+  return Math.random().toString(36).substr(2) + Date.now().toString(36);
+}
+
+// Ejecutar verificación si estamos en página de éxito
+window.addEventListener('load', () => {
+  const urlParams = new URLSearchParams(window.location.search);
+  const sessionId = urlParams.get('session_id');
+  
+  if (sessionId) {
+    verifyPurchase(sessionId);
+  }
+});
